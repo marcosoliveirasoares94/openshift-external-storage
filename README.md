@@ -1,42 +1,95 @@
-Although many of these recipes still work, this repo is now deprecated, moving work to https://github.com/kubernetes-sigs/sig-storage-lib-external-provisioner, come join us there !  
+#
+# Install NFS Server
+#
 
-# External Storage
-[![Build Status](https://travis-ci.org/kubernetes-incubator/external-storage.svg?branch=master)](https://travis-ci.org/kubernetes-incubator/external-storage)
-[![GoDoc](https://godoc.org/github.com/kubernetes-incubator/external-storage?status.svg)](https://godoc.org/github.com/kubernetes-incubator/external-storage)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kubernetes-incubator/external-storage)](https://goreportcard.com/report/github.com/kubernetes-incubator/external-storage)
+# Create a Centos/RHEL 7 based instance and run the following commands as root
 
-## External Provisioners
-This repository houses community-maintained external provisioners plus a helper library for building them. Each provisioner is contained in its own directory so for information on how to use one, enter its directory and read its documentation. The library is contained in the `lib` directory.
+	yum install -y nfs-utils
+	systemctl enable rpcbind
+	systemctl enable nfs-server
+	systemctl start rpcbind
+	systemctl start nfs-server
 
-### What is an 'external provisioner'?
-An external provisioner is a dynamic PV provisioner whose code lives out-of-tree/external to Kubernetes. Unlike [in-tree dynamic provisioners](https://kubernetes.io/docs/concepts/storage/storage-classes/#provisioner) that run as part of the Kubernetes controller manager, external ones can be deployed & updated independently.
+	mkdir /ifs/storage && chmod -R 755 /ifs/storage
 
-External provisioners work just like in-tree dynamic PV provisioners. A `StorageClass` object can specify an external provisioner instance to be its `provisioner` like it can in-tree provisioners. The instance will then watch for `PersistentVolumeClaims` that ask for the `StorageClass` and automatically create `PersistentVolumes` for them. For more information on how dynamic provisioning works, see [the docs](http://kubernetes.io/docs/user-guide/persistent-volumes/) or [this blog post](https://kubernetes.io/blog/2016/10/dynamic-provisioning-and-storage-in-kubernetes/).
+	firewall-cmd --permanent --zone=public --add-service=nfs
+	firewall-cmd --permanent --zone=public --add-service=rpcbind
+	firewall-cmd --reload
 
-### How to use the library
-**`lib` is deprecated. The library has moved to [kubernetes-sigs/sig-storage-lib-external-provisioner](https://github.com/kubernetes-sigs/sig-storage-lib-external-provisioner).**
+# To allow all clients put *
+	vi /etc/exports
+	/ifs/storage *(rw,sync,no_root_squash)
 
-## Roadmap
+or you can limit to a subnet/IP
+	/ifs/storage 172.16.2.0/24(rw,sync,no_root_squash)
+	systemctl restart nfs-server
 
-February
-* Finalize repo structure, release process, etc.
+#
+# Install nfs-utils package on all openshift nodes
+#
+	yum install -y nfs-utils
 
-## Community, discussion, contribution, and support
+#
+# Download kubernetes-incubator
+#
+	curl -L -o kubernetes-incubator.zip https://github.com/marcosoliveirasoares94/openshift-external-storage/archive/main.zip
 
-Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).
+	unzip kubernetes-incubator.zip && mv openshift-external-storage-main openshift-external-storage && rm -rf openshift-external-storage-main
 
-You can reach the maintainers of this project at:
+	cd openshift-external-storage/nfs-client/
 
-- Slack: #sig-storage
+#
+# Create Workspace
+#
+oc new-project managed-nfs-storage --display-name="managed-nfs-storage" --description="Managed NFS Storage"
 
-## Kubernetes Incubator
+# Change default namespace with current project/namespace. If you are in different project right now. Please switch to target project before running the commands below:
 
-This is a [Kubernetes Incubator project](https://github.com/kubernetes/community/blob/master/incubator.md). The project was established 2016-11-15 (as nfs-provisioner). The incubator team for the project is:
+	NAMESPACE=`oc project -q`
+	sed -i'' "s/namespace:.*/namespace: $NAMESPACE/g" ./deploy/rbac.yaml
+    sed -i'' "s/namespace:.*/namespace: $NAMESPACE/g" ./deploy/deployment.yaml
 
-- Sponsor: Clayton (@smarterclayton)
-- Champion: Jan (@jsafrane) & Brad (@childsb)
-- SIG: sig-storage
+# Create the service account and role bindings.
+	oc create -f deploy/rbac.yaml
 
-### Code of conduct
+# Allow run as root and mount permission to nfs-client-provisioner. To grant this permission, you must be logged in to openshift with admin privileges.
+	oc adm policy add-scc-to-user hostmount-anyuid system:serviceaccount:$NAMESPACE:nfs-client-provisioner
 
-Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
+# edit deploy/deployment.yaml
+# Change the following parameters with yours <YOUR NFS SERVER HOSTNAME> It is 172.16.2.5 in my case and change /var/nfs with /var/nfsshare
+# which we configured above. Also You don’t have to change PROVISIONER_NAME value fuseim.pri/ifs but it is good to change with your enviroment. for example myproject/nfs
+	— name: PROVISIONER_NAME
+	value: fuseim.pri/ifs
+	— name: NFS_SERVER
+	value: 172.16.2.5
+	— name: NFS_PATH
+	value: /ifs/storage
+	volumes:
+	— name: nfs-client-root
+	nfs:
+	server: 172.16.2.5
+	path: /ifs/storage
+
+# Edit deploy/class.yaml file
+	set provisioner: fuseim.pri/ifs value as you defined PROVISIONER_NAME in deploy/deployment.yaml (myproject/nfs). It must match PROVISIONER_NAME otherwise it will fail!
+
+# class.yaml defines the NFS-Client’s Kubernetes Storage Class with name: managed-nfs-storage
+
+# We will define this storage-class name in claim yaml files later.
+
+#
+# Deploy and create storage class
+#
+
+	oc create -f deploy/class.yaml
+	oc create -f deploy/deployment.yaml
+
+# Check nfs-client-provisioner pod. Ensure that nfs-client-provisioner is running.
+	oc get pods
+	NAME                                    READY STATUS RESTARTS AGE
+	nfs-client-provisioner-6f59b7b5f4-sd7r2    1/1 Running 2      1h
+
+# Check the logs if there is a failure. If you don’t add hostmount-anyuid above, it will never work! Please double check it if you see an issue.
+	oc logs nfs-client-provisioner-6f59b7b5f4-sd7r2
+
+# Now we can create claim and test pod. You don’t have to mount NFS share on openshift master or nodes. nfs-client-provisioner will do it automatically and on demand.
